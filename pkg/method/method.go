@@ -17,6 +17,8 @@ import (
 	"github.com/AkihiroSuda/apt-transport-oci/pkg/version"
 	"github.com/containerd/containerd/v2/core/images"
 	"github.com/containerd/containerd/v2/core/remotes"
+	"github.com/containerd/containerd/v2/core/remotes/docker"
+	"github.com/containerd/containerd/v2/core/remotes/docker/config"
 	refdocker "github.com/distribution/reference"
 	"github.com/opencontainers/go-digest"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
@@ -109,16 +111,13 @@ func (m *Method) handleURIAcquire(ctx context.Context, msg *apt.Message) {
 	}
 }
 
-func (m *Method) ociResolver(named refdocker.Named) (remotes.Resolver, error) {
-	ref := named.String()
-	refDomain := refdocker.Domain(named)
-	var dOpts []dockerconfigresolver.Opt
+func (m *Method) ociResolver() remotes.Resolver {
 	// TODO: support insecure non-TLS registry
-	resolver, err := dockerconfigresolver.New(refDomain, dOpts...)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create a resolver for refDomain=%q (ref=%q): %w", refDomain, ref, err)
-	}
-	return resolver, err
+	return docker.NewResolver(docker.ResolverOptions{
+		Hosts: config.ConfigureHosts(context.Background(), config.HostOptions{
+			Credentials: dockerconfigresolver.Credentials,
+		}),
+	})
 }
 
 func (m *Method) ociFetcher(ctx context.Context, named refdocker.Named, resolver remotes.Resolver) (remotes.Fetcher, ocispec.Descriptor, error) {
@@ -263,10 +262,7 @@ func (m *Method) doCacheStuff(ctx context.Context, uri string, ociRef refdocker.
 	}
 
 	m.Statusf(uri, "Creating a resolver for ociRef=%q", ociRef)
-	resolver, err := m.ociResolver(ociRef)
-	if err != nil {
-		return nil, err
-	}
+	resolver := m.ociResolver()
 
 	m.Statusf(uri, "Creating a fetcher for ociRef=%q", ociRef)
 	fetcher, rootDesc, err := m.ociFetcher(ctx, ociRef, resolver)
