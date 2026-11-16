@@ -1,6 +1,7 @@
 package method
 
 import (
+	"net/textproto"
 	"testing"
 
 	"github.com/AkihiroSuda/apt-transport-oci/pkg/apt"
@@ -45,7 +46,11 @@ func TestExpectedBlob(t *testing.T) {
 		},
 	} {
 		t.Run(name, func(t *testing.T) {
-			desc, ok := expectedBlob(&apt.Message{Fields: tc.v})
+			fields := textproto.MIMEHeader{}
+			for key, value := range tc.v {
+				fields.Set(key, value)
+			}
+			desc, ok := expectedBlob(&apt.Message{Fields: fields})
 			if ok != (tc.xDigest != "") {
 				t.Fatalf("expected ok=%v, got %v", tc.xDigest != "", ok)
 			}

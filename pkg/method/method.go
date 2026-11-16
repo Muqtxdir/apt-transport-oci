@@ -1,7 +1,6 @@
 package method
 
 import (
-	"bufio"
 	"context"
 	"encoding/json"
 	"errors"
@@ -26,7 +25,6 @@ import (
 // Protocol: see https://justi.cz/security/2019/01/22/apt-rce.html
 // See also the output of `apt-get -o Debug::pkgAcquire::Worker=1 update`
 const (
-	CodeURIAcquire        = 600
 	FieldURI              = "URI"
 	FieldMessage          = "Message"
 	FieldTargetRepoURI    = "Target-Repo-URI"
@@ -37,6 +35,7 @@ const (
 	FieldSHA512Hash       = "SHA512-Hash"
 	FieldExpectedSHA512   = "Expected-SHA512"
 	FieldExpectedFileSize = "Expected-Checksum-FileSize"
+	FieldFailReason       = "FailReason"
 )
 
 const (
@@ -47,7 +46,7 @@ const (
 func New(out io.Writer, in io.Reader) *Method {
 	m := &Method{
 		w:             apt.NewMessageWriter(out),
-		r:             apt.NewMessageReader(bufio.NewReader(in)),
+		r:             apt.NewMessageReader(in),
 		cacheByOCIRef: make(map[string]cacheByOCIRef),
 	}
 	return m
@@ -71,42 +70,42 @@ type Method struct {
 // Run is based on https://github.com/cloudflare/apt-transport-cloudflared/blob/96e1417f9c54/apt/method.go#L77-L108
 func (m *Method) Run(ctx context.Context) {
 	version := fmt.Sprintf("%d.%d", version.Major, version.Minor)
-	m.w.Capabilities(version, apt.CapPipeline)
+	m.w.WriteMessage(apt.CodeCapabilities,
+		apt.Field{Key: "Version", Value: version},
+		apt.Field{Key: "Pipeline", Value: "true"},
+	)
 	var requests sync.WaitGroup
 	defer requests.Wait()
 	for {
 		msg, err := m.r.ReadMessage()
+		if errors.Is(err, io.EOF) || errors.Is(err, io.ErrClosedPipe) {
+			return
+		}
 		if err != nil {
-			switch {
-			case errors.Is(err, io.EOF), errors.Is(err, io.ErrClosedPipe):
-				return
-			case errors.Is(err, io.ErrNoProgress), errors.Is(err, io.ErrShortBuffer):
-				// NOP
-			default:
-				m.w.GeneralFailuref("Error reading message: %v", err)
-				return
-			}
+			m.w.WriteMessage(apt.CodeGeneralFailure,
+				apt.Field{Key: FieldMessage, Value: fmt.Sprintf("Error reading message: %v", err)})
+			return
 		}
 		switch msg.StatusCode {
-		case CodeURIAcquire:
+		case apt.CodeURIAcquire:
 			requests.Go(func() { m.handleURIAcquire(ctx, msg) })
 		default:
-			m.w.Logf("Unknown message: %d %s", msg.StatusCode, msg.Description)
+			m.w.WriteMessage(apt.CodeLog,
+				apt.Field{Key: FieldMessage, Value: fmt.Sprintf("Unknown message: %d %s", msg.StatusCode, msg.Description)})
 		}
 	}
 }
 
 func (m *Method) handleURIAcquire(ctx context.Context, msg *apt.Message) {
 	if started, err := m.acquire(ctx, msg); err != nil {
-		const (
-			transientError = false
-			usedMirror     = false
-		)
-		uri := msg.Fields[FieldURI]
+		uri := msg.Fields.Get(FieldURI)
 		if !started {
-			m.w.StartURI(uri, "", 0, usedMirror)
+			m.w.WriteMessage(apt.CodeURIStart, apt.Field{Key: FieldURI, Value: uri})
 		}
-		m.w.FailedURI(uri, err.Error(), err.Error(), transientError, usedMirror)
+		m.w.WriteMessage(apt.CodeURIFailure,
+			apt.Field{Key: FieldURI, Value: uri},
+			apt.Field{Key: FieldFailReason, Value: err.Error()},
+		)
 	}
 }
 
@@ -219,9 +218,9 @@ func parseURI(uri string) (repo, path string, _ error) {
 }
 
 func parseURIFields(msg *apt.Message) (ociRef refdocker.Named, title string, err error) {
-	repoURI := msg.Fields[FieldTargetRepoURI]
+	repoURI := msg.Fields.Get(FieldTargetRepoURI)
 	if repoURI == "" {
-		uri := msg.Fields[FieldURI]
+		uri := msg.Fields.Get(FieldURI)
 		if uri == "" {
 			return ociRef, "", fmt.Errorf("missing field %q", FieldTargetRepoURI)
 		}
@@ -239,22 +238,17 @@ func parseURIFields(msg *apt.Message) (ociRef refdocker.Named, title string, err
 	if err != nil {
 		return ociRef, "", fmt.Errorf("failed to parse %q (%s=%q) as Docker reference: %w", refTmp, FieldTargetRepoURI, repoURI, err)
 	}
-	title = strings.TrimPrefix(msg.Fields[FieldURI], repoURI)
+	title = strings.TrimPrefix(msg.Fields.Get(FieldURI), repoURI)
 	// not robust, but no security issue (cuz not referring to the actual filesystem)
 	title = strings.TrimPrefix(title, "./")
 	return ociRef, title, nil
 }
 
 func (m *Method) Status(uri, s string) {
-	msg := &apt.Message{
-		StatusCode:  102,
-		Description: "Status",
-		Fields: map[string]string{
-			FieldURI:     uri,
-			FieldMessage: s,
-		},
-	}
-	m.w.WriteMessage(msg)
+	m.w.WriteMessage(apt.CodeStatus,
+		apt.Field{Key: FieldURI, Value: uri},
+		apt.Field{Key: FieldMessage, Value: s},
+	)
 }
 
 func (m *Method) Statusf(uri, fmtspec string, args ...any) {
@@ -295,13 +289,13 @@ func (m *Method) doCacheStuff(ctx context.Context, uri string, ociRef refdocker.
 }
 
 func expectedBlob(msg *apt.Message) (ocispec.Descriptor, bool) {
-	size, err := strconv.ParseInt(msg.Fields[FieldExpectedFileSize], 10, 64)
+	size, err := strconv.ParseInt(msg.Fields.Get(FieldExpectedFileSize), 10, 64)
 	if err != nil || size < 0 {
 		return ocispec.Descriptor{}, false
 	}
 	for _, dgst := range []digest.Digest{
-		digest.NewDigestFromEncoded(digest.SHA256, msg.Fields[FieldExpectedSHA256]),
-		digest.NewDigestFromEncoded(digest.SHA512, msg.Fields[FieldExpectedSHA512]),
+		digest.NewDigestFromEncoded(digest.SHA256, msg.Fields.Get(FieldExpectedSHA256)),
+		digest.NewDigestFromEncoded(digest.SHA512, msg.Fields.Get(FieldExpectedSHA512)),
 	} {
 		if dgst.Validate() == nil {
 			return ocispec.Descriptor{
@@ -315,8 +309,8 @@ func expectedBlob(msg *apt.Message) (ocispec.Descriptor, bool) {
 }
 
 func (m *Method) acquire(ctx context.Context, msg *apt.Message) (started bool, err error) {
-	uri := msg.Fields[FieldURI]
-	filename := msg.Fields[FieldFilename]
+	uri := msg.Fields.Get(FieldURI)
+	filename := msg.Fields.Get(FieldFilename)
 
 	m.Statusf(uri, "Parsing msg: %+v", msg)
 	ociRef, title, err := parseURIFields(msg)
@@ -341,14 +335,14 @@ func (m *Method) acquire(ctx context.Context, msg *apt.Message) (started bool, e
 	case MediaTypeApplicationOctetStream, MediaTypeApplicationXBinary:
 		// NOP
 	default:
-		m.w.Warningf("expected media type of %q to be %q, got %q", title, MediaTypeApplicationXBinary, desc.MediaType)
+		m.w.WriteMessage(apt.CodeWarning, apt.Field{Key: FieldMessage,
+			Value: fmt.Sprintf("expected media type of %q to be %q, got %q", title, MediaTypeApplicationXBinary, desc.MediaType)})
 	}
 
-	const (
-		resumePoint = ""
-		usedMirror  = false
+	m.w.WriteMessage(apt.CodeURIStart,
+		apt.Field{Key: FieldURI, Value: uri},
+		apt.Field{Key: FieldSize, Value: strconv.FormatInt(desc.Size, 10)},
 	)
-	m.w.StartURI(uri, resumePoint, desc.Size, usedMirror)
 	started = true
 
 	r, err := c.fetcher.Fetch(ctx, desc)
@@ -387,15 +381,12 @@ func (m *Method) acquire(ctx context.Context, msg *apt.Message) (started bool, e
 		}
 	}
 
-	const (
-		altIMSHit = ""
-		imsHit    = false
+	m.w.WriteMessage(apt.CodeURIDone,
+		apt.Field{Key: FieldURI, Value: uri},
+		apt.Field{Key: FieldFilename, Value: filename},
+		apt.Field{Key: FieldSize, Value: strconv.FormatInt(desc.Size, 10)},
+		apt.Field{Key: FieldSHA256Hash, Value: sha256Digest.Encoded()},
+		apt.Field{Key: FieldSHA512Hash, Value: sha512Digest.Encoded()},
 	)
-	fields := []apt.Field{
-		{Key: FieldSize, Value: strconv.FormatInt(desc.Size, 10)},
-		{Key: FieldSHA256Hash, Value: sha256Digest.Encoded()},
-		{Key: FieldSHA512Hash, Value: sha512Digest.Encoded()},
-	}
-	m.w.FinishURI(uri, filename, resumePoint, altIMSHit, imsHit, usedMirror, fields...)
 	return started, nil
 }
